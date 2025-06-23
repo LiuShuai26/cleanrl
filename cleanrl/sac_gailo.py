@@ -1,4 +1,3 @@
-# docs and experiment results can be found at https://docs.cleanrl.dev/rl-algorithms/sac/#sac_continuous_actionpy
 import os
 os.environ["MUJOCO_GL"] = "egl"
 os.environ["PYOPENGL_PLATFORM"] = "egl"
@@ -22,6 +21,30 @@ from gymnasium.wrappers import FlattenObservation, TransformObservation
 from gymnasium.spaces import Box
 
 
+# ------------------- Expert dataset loader -------------------
+def load_expert_transitions(path, normalize=True):
+    # load precomputed numpy array of shape [N-1, state_dim*2]
+    data = np.load(path)  # assumed shape (num_pairs, state_dim*2)
+    if normalize:
+        mean = data.mean(axis=0, keepdims=True)
+        std  = data.std(axis=0, keepdims=True) + 1e-6
+        data = (data - mean) / std
+    return torch.tensor(data, dtype=torch.float32)
+
+# ------------------- Discriminator -------------------
+class Discriminator(nn.Module):
+    def __init__(self, state_dim):
+        super().__init__()
+        self.fc1 = nn.Linear(state_dim*2, 256)
+        self.fc2 = nn.Linear(256, 256)
+        self.fc3 = nn.Linear(256, 1)
+    def forward(self, s, s_next):
+        x = torch.cat([s, s_next], dim=1)
+        x = F.leaky_relu(self.fc1(x))
+        x = F.leaky_relu(self.fc2(x))
+        return torch.sigmoid(self.fc3(x))
+
+
 
 @dataclass
 class Args:
@@ -41,6 +64,9 @@ class Args:
     """the entity (team) of wandb's project"""
     capture_video: bool = False
     """whether to capture videos of the agent performances (check out `videos` folder)"""
+
+    # Expert dataset
+    expert_data: str = "expert_pairs.npy"  # path to expert transitions
 
     # Algorithm specific arguments
     env_id: str = "Hopper-v4"
@@ -250,6 +276,12 @@ poetry run pip install "stable_baselines3==2.0.0a1"
         alpha = args.alpha
 
     envs.single_observation_space.dtype = np.float32
+
+    # load expert dataset
+    expert_data = load_expert_transitions(args.expert_data)
+    disc = Discriminator(envs.single_observation_space.shape[0]).to(device)
+    disc_opt = optim.Adam(disc.parameters(), lr=1e-4)
+
     rb = ReplayBuffer(
         args.buffer_size,
         envs.single_observation_space,
@@ -294,7 +326,30 @@ poetry run pip install "stable_baselines3==2.0.0a1"
 
         # ALGO LOGIC: training.
         if global_step > args.learning_starts:
+            # 1) sample agent batch
             data = rb.sample(args.batch_size)
+            s_batch = data.observations
+            s_next_batch = data.next_observations
+            a_batch = data.actions
+
+            # 2) update discriminator
+            # sample expert minibatch
+            idx = torch.randint(0, len(expert_data), (args.batch_size,))
+            ex = expert_data[idx]
+            s_ex, s_ex_next = ex.split(envs.single_observation_space.shape[0], dim=1)
+            # forward
+            D_ex = disc(s_ex.to(device), s_ex_next.to(device))
+            D_ag = disc(s_batch, s_next_batch)
+            loss_D = - (torch.log(D_ex+1e-8).mean() + torch.log(1-D_ag+1e-8).mean())
+            disc_opt.zero_grad(); loss_D.backward(); disc_opt.step()
+
+            # 3) compute imitation reward
+            with torch.no_grad():
+                D_val = disc(s_batch, s_next_batch)
+                r_imit = -torch.log(1 - D_val + 1e-8).clamp(max=10)
+                # replace env reward by imitation reward
+                data.rewards = r_imit.cpu().numpy().reshape(-1,1)
+
             with torch.no_grad():
                 next_state_actions, next_state_log_pi, _ = actor.get_action(data.next_observations)
                 qf1_next_target = qf1_target(data.next_observations, next_state_actions)
