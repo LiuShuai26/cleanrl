@@ -22,35 +22,41 @@ from gymnasium.spaces import Box
 
 
 # ------------------- Expert dataset loader -------------------
-def load_expert_transitions(path, normalize=True):
+def load_expert_transitions(path):
     # load precomputed numpy array of shape [N-1, state_dim*2]
     data = np.load(path)  # assumed shape (num_pairs, state_dim*2)
-    if normalize:
-        mean = data.mean(axis=0, keepdims=True)
-        std  = data.std(axis=0, keepdims=True) + 1e-6
-        data = (data - mean) / std
-    return torch.tensor(data, dtype=torch.float32)
+    
+    mean = data.mean(axis=0, keepdims=True)
+    std  = data.std(axis=0, keepdims=True) + 1e-6
+    data = (data - mean) / std
+    return torch.tensor(data, dtype=torch.float32), mean, std
 
 # ------------------- Discriminator -------------------
 class Discriminator(nn.Module):
     def __init__(self, state_dim):
         super().__init__()
-        self.fc1 = nn.Linear(state_dim*2, 256)
-        self.fc2 = nn.Linear(256, 256)
-        self.fc3 = nn.Linear(256, 1)
-    def forward(self, s, s_next):
-        x = torch.cat([s, s_next], dim=1)
-        x = F.leaky_relu(self.fc1(x))
+        self.fc1 = nn.Linear(6, 64)
+        self.fc2 = nn.Linear(64, 32)
+        self.fc3 = nn.Linear(32, 1)
+        self.dropout = nn.Dropout(p=0.2)
+        
+    def forward(self, s):
+        # x = torch.cat([s, s_next], dim=1)
+        x = F.leaky_relu(self.fc1(s))
+        x = self.dropout(x)
         x = F.leaky_relu(self.fc2(x))
+        x = self.dropout(x)
         return torch.sigmoid(self.fc3(x))
 
 
+def add_input_noise(x, std=0.01):
+    return x + std * torch.randn_like(x)
 
 @dataclass
 class Args:
     exp_name: str = os.path.basename(__file__)[: -len(".py")]
     """the name of this experiment"""
-    seed: int = 1
+    seed: int = 42
     """seed of the experiment"""
     torch_deterministic: bool = True
     """if toggled, `torch.backends.cudnn.deterministic=False`"""
@@ -69,7 +75,7 @@ class Args:
     expert_data: str = "expert_pairs.npy"  # path to expert transitions
 
     # Algorithm specific arguments
-    env_id: str = "Hopper-v4"
+    env_id: str = "move-ego-0-2"
     """the environment id of the task"""
     total_timesteps: int = 10000000
     """total timesteps of the experiments"""
@@ -85,6 +91,9 @@ class Args:
     """the batch size of sample from the reply memory"""
     learning_starts: int = 5e3
     """timestep to start learning"""
+
+    disc_start_step: int = 400e3
+
     policy_lr: float = 1e-4
     """the learning rate of the policy network optimizer"""
     q_lr: float = 1e-4
@@ -109,6 +118,8 @@ def make_humenv_thunk(seed: int, idx: int):
             wrappers=[FlattenObservation],  # flatten any dict/array obs → 1D vector
             seed=seed + idx,
         )
+        env.metadata["render_fps"] = 30
+
         # record statistics (and optionally video)
         env = gym.wrappers.RecordEpisodeStatistics(env)
         if args.capture_video and idx == 0:
@@ -278,9 +289,12 @@ poetry run pip install "stable_baselines3==2.0.0a1"
     envs.single_observation_space.dtype = np.float32
 
     # load expert dataset
-    expert_data = load_expert_transitions(args.expert_data)
+    expert_data, expert_mean, expert_std = load_expert_transitions(args.expert_data)
+    expert_mean = torch.from_numpy(expert_mean).float().to(device)  # (1,18) tensor on GPU
+    expert_std  = torch.from_numpy(expert_std).float().to(device)
+    expert_data = expert_data.to(device)
     disc = Discriminator(envs.single_observation_space.shape[0]).to(device)
-    disc_opt = optim.Adam(disc.parameters(), lr=1e-4)
+    disc_opt = optim.Adam(disc.parameters(), lr=1e-5)
 
     rb = ReplayBuffer(
         args.buffer_size,
@@ -291,6 +305,9 @@ poetry run pip install "stable_baselines3==2.0.0a1"
         handle_timeout_termination=False,
     )
     start_time = time.time()
+
+    total_r_imit = 0.0
+    total_r_env = 0.0
 
     # TRY NOT TO MODIFY: start the game
     obs, _ = envs.reset(seed=args.seed)
@@ -312,6 +329,10 @@ poetry run pip install "stable_baselines3==2.0.0a1"
                     print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
                     writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
                     writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
+                    writer.add_scalar("charts/total_r_env", total_r_env, global_step)
+                    writer.add_scalar("charts/total_r_imit", total_r_imit, global_step)
+                    total_r_env = 0.0
+                    total_r_imit = 0.0
                     break
 
         # TRY NOT TO MODIFY: save data to reply buffer; handle `final_observation`
@@ -327,40 +348,109 @@ poetry run pip install "stable_baselines3==2.0.0a1"
         # ALGO LOGIC: training.
         if global_step > args.learning_starts:
             # 1) sample agent batch
-            data = rb.sample(args.batch_size)
-            s_batch = data.observations
-            s_next_batch = data.next_observations
-            a_batch = data.actions
+            batch = rb.sample(args.batch_size)
+            obs_batch       = batch.observations.to(device)          # (B, S)
+            next_obs_batch  = batch.next_observations.to(device)     # (B, S)
+            actions_batch   = batch.actions.to(device)               # (B, A)
+            env_r_batch     = batch.rewards.view(-1).to(device)      # (B,)
+            dones_batch     = batch.dones.view(-1).to(device)        # (B,)
 
-            # 2) update discriminator
-            # sample expert minibatch
-            idx = torch.randint(0, len(expert_data), (args.batch_size,))
-            ex = expert_data[idx]
-            s_ex, s_ex_next = ex.split(envs.single_observation_space.shape[0], dim=1)
-            # forward
-            D_ex = disc(s_ex.to(device), s_ex_next.to(device))
-            D_ag = disc(s_batch, s_next_batch)
-            loss_D = - (torch.log(D_ex+1e-8).mean() + torch.log(1-D_ag+1e-8).mean())
-            disc_opt.zero_grad(); loss_D.backward(); disc_opt.step()
+            if global_step > args.disc_start_step:
 
-            # 3) compute imitation reward
+                # TODO 
+                # add hand position and velocity
+                # add ankle velocity
+
+                # 1a) slice out your 6-dim gait features
+                # point_idxs:
+                #  214, 215, 216: body velocity x, y, z
+                #  7, 8, 9: L_ankle x, y, z
+                #  19, 20, 21: R_ankle x, y, z
+                body_idx = [214, 216]
+                left_idx = [7, 9]
+                right_idx = [19, 21]
+
+                body_vel = obs_batch[:, body_idx]          # (B, 3)
+                l_rel = obs_batch[:, left_idx]
+                r_rel = obs_batch[:, right_idx]
+
+                # agent feature at t
+                s_ag = torch.cat([body_vel, l_rel, r_rel], dim=1)  # (B, 6)
+
+                # repeat for next_obs
+                body_vel1 = next_obs_batch[:, body_idx]
+                l_rel1 = next_obs_batch[:, left_idx]
+                r_rel1 = next_obs_batch[:, right_idx]
+
+                # velocity from next_obs and next_next_obs is not available, so reuse body_vel (approximate)
+                s_ag_next = torch.cat([body_vel1, l_rel1, r_rel1], dim=1)  # (B, 6)
+                
+                # combine (s, s′)
+                ag_pair = torch.cat([s_ag, s_ag_next], dim=1)  # (B, 12)
+
+                # Add noise before normalization
+                ag_pair_noisy = add_input_noise(ag_pair, std=0.05)
+
+                # 2) bring agent into the expert’s normalized space
+                # ag_norm    = (ag_pair_noisy - expert_mean.to(device)) \
+                #         /  expert_std.to(device)
+
+                # 3) split back to (s,s′)
+                s_ag_norm, s_ag_next_norm = ag_pair_noisy.chunk(2, dim=1)
+
+                # 2) update discriminator on a batch of expert vs agent transitions
+                #   sample a whole batch of expert transitions (shape (B,12))
+                idx      = torch.randint(0, len(expert_data), (args.batch_size,), device=device)
+                ex_batch = expert_data[idx].to(device)            # (B,12)
+                ex_batch_noisy = add_input_noise(ex_batch, std=0.05)
+                # split into (s, s')
+                s_ex, s_ex_next = ex_batch_noisy.chunk(2, dim=1)        # two (B,6)
+
+                # forward pass
+                D_ex = disc(s_ex)   # (B,1)
+                D_ag = disc(s_ag_norm)   # (B,1)
+
+                real_label = 0.8
+                fake_label = 0.2
+
+                loss_D = - (
+                    (real_label * torch.log(D_ex + 1e-8)).mean() +
+                    ((1 - fake_label) * torch.log(1 - D_ag + 1e-8)).mean()
+                )
+
+                disc_opt.zero_grad()
+                loss_D.backward()
+                disc_opt.step()
+
+                # 3) compute imitation reward for this agent batch
+                with torch.no_grad():
+                    D_val  = disc(s_ag_norm)             # (B,1)
+                    r_imit = -torch.log(1 - D_val + 1e-8).clamp(max=10)  # (B,1)
+                    r_imit = r_imit.view(-1)                             # (B,)
+            else:
+                # if we are before the discriminator start step, use imitation reward = 0
+                r_imit = torch.zeros((args.batch_size,), device=device)
+
+            fraction = 0.5
+            # 4) combine env + imitation reward
+            r_total = fraction * env_r_batch + (1 - fraction) * r_imit   # (B,)
+
+            total_r_imit += r_imit.sum().item() / args.batch_size
+            total_r_env += env_r_batch.sum().item() / args.batch_size
+
+            # 5) compute SAC targets with r_total
             with torch.no_grad():
-                D_val = disc(s_batch, s_next_batch)
-                r_imit = -torch.log(1 - D_val + 1e-8).clamp(max=10)
-                # replace env reward by imitation reward
-                data.rewards = r_imit.cpu().numpy().reshape(-1,1)
+                next_a, next_log_pi, _ = actor.get_action(next_obs_batch)         # (B,A), (B,1)
+                q1_t = qf1_target(next_obs_batch, next_a).view(-1)                # (B,)
+                q2_t = qf2_target(next_obs_batch, next_a).view(-1)                # (B,)
+                min_q_t = torch.min(q1_t, q2_t) - alpha * next_log_pi.view(-1)
+                target_q = r_total + (1.0 - dones_batch) * args.gamma * min_q_t  # (B,)
 
-            with torch.no_grad():
-                next_state_actions, next_state_log_pi, _ = actor.get_action(data.next_observations)
-                qf1_next_target = qf1_target(data.next_observations, next_state_actions)
-                qf2_next_target = qf2_target(data.next_observations, next_state_actions)
-                min_qf_next_target = torch.min(qf1_next_target, qf2_next_target) - alpha * next_state_log_pi
-                next_q_value = data.rewards.flatten() + (1 - data.dones.flatten()) * args.gamma * (min_qf_next_target).view(-1)
-
-            qf1_a_values = qf1(data.observations, data.actions).view(-1)
-            qf2_a_values = qf2(data.observations, data.actions).view(-1)
-            qf1_loss = F.mse_loss(qf1_a_values, next_q_value)
-            qf2_loss = F.mse_loss(qf2_a_values, next_q_value)
+            # 6) standard Q‐function update
+            q1_pred = qf1(obs_batch, actions_batch).view(-1)    # (B,)
+            q2_pred = qf2(obs_batch, actions_batch).view(-1)    # (B,)
+            qf1_loss = F.mse_loss(q1_pred, target_q)
+            qf2_loss = F.mse_loss(q2_pred, target_q)
             qf_loss = qf1_loss + qf2_loss
 
             # optimize the model
@@ -372,9 +462,9 @@ poetry run pip install "stable_baselines3==2.0.0a1"
                 for _ in range(
                     args.policy_frequency
                 ):  # compensate for the delay by doing 'actor_update_interval' instead of 1
-                    pi, log_pi, _ = actor.get_action(data.observations)
-                    qf1_pi = qf1(data.observations, pi)
-                    qf2_pi = qf2(data.observations, pi)
+                    pi, log_pi, _ = actor.get_action(obs_batch)
+                    qf1_pi = qf1(obs_batch, pi)
+                    qf2_pi = qf2(obs_batch, pi)
                     min_qf_pi = torch.min(qf1_pi, qf2_pi)
                     actor_loss = ((alpha * log_pi) - min_qf_pi).mean()
 
@@ -384,7 +474,7 @@ poetry run pip install "stable_baselines3==2.0.0a1"
 
                     if args.autotune:
                         with torch.no_grad():
-                            _, log_pi, _ = actor.get_action(data.observations)
+                            _, log_pi, _ = actor.get_action(obs_batch)
                         alpha_loss = (-log_alpha.exp() * (log_pi + target_entropy)).mean()
 
                         a_optimizer.zero_grad()
@@ -400,8 +490,23 @@ poetry run pip install "stable_baselines3==2.0.0a1"
                     target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
 
             if global_step % 100 == 0:
-                writer.add_scalar("losses/qf1_values", qf1_a_values.mean().item(), global_step)
-                writer.add_scalar("losses/qf2_values", qf2_a_values.mean().item(), global_step)
+                # 1) Loss
+                if global_step > args.disc_start_step:
+                    writer.add_scalar("discriminator/loss", loss_D.item(), global_step)
+
+                    # 2) D_ex, D_ag means
+                    writer.add_scalar("discriminator/D_ex_mean", D_ex.mean().item(), global_step)
+                    writer.add_scalar("discriminator/D_ag_mean", D_ag.mean().item(), global_step)
+
+                    # 3) Accuracy proxies
+                    with torch.no_grad():
+                        acc_ex = (D_ex > 0.5).float().mean().item()
+                        acc_ag = (D_ag < 0.5).float().mean().item()
+                    writer.add_scalar("discriminator/acc_expert", acc_ex, global_step)
+                    writer.add_scalar("discriminator/acc_agent",  acc_ag, global_step)
+                
+                writer.add_scalar("losses/qf1_values", q1_pred.mean().item(), global_step)
+                writer.add_scalar("losses/qf2_values", q2_pred.mean().item(), global_step)
                 writer.add_scalar("losses/qf1_loss", qf1_loss.item(), global_step)
                 writer.add_scalar("losses/qf2_loss", qf2_loss.item(), global_step)
                 writer.add_scalar("losses/qf_loss", qf_loss.item() / 2.0, global_step)
@@ -416,6 +521,18 @@ poetry run pip install "stable_baselines3==2.0.0a1"
                 if args.autotune:
                     writer.add_scalar("losses/alpha_loss", alpha_loss.item(), global_step)
 
+            if global_step % 100000 == 0:
+                save_path = f"checkpoints/{run_name}"
+                os.makedirs(save_path, exist_ok=True)
+                torch.save({
+                    "actor": actor.state_dict(),
+                    "qf1": qf1.state_dict(),
+                    "qf2": qf2.state_dict(),
+                    "log_alpha": log_alpha if args.autotune else None,
+                    "args": vars(args),
+                }, os.path.join(save_path, "checkpoint" + str(global_step) + ".pt"))
+
+
     # Save the model
     save_path = f"checkpoints/{run_name}"
     os.makedirs(save_path, exist_ok=True)
@@ -425,7 +542,7 @@ poetry run pip install "stable_baselines3==2.0.0a1"
         "qf2": qf2.state_dict(),
         "log_alpha": log_alpha if args.autotune else None,
         "args": vars(args),
-    }, os.path.join(save_path, "checkpoint.pt"))
+    }, os.path.join(save_path, "final_checkpoint.pt"))
 
     envs.close()
     writer.close()
